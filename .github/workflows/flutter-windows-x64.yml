@@ -3,6 +3,13 @@
 # build-for-windows-flutter in flutter-build.yml, keeping only what the
 # x86_64-pc-windows-msvc build needs. Cache keys match those jobs so their
 # caches are shared.
+#
+# fast-build: thin LTO and 16 codegen units instead of the release profile's
+#   fat LTO and 1 unit. The final link is much faster; the binary is a little
+#   larger and slower.
+# reuse-rust: when no Rust-side input (Cargo files, build.rs, vcpkg ports,
+#   src/, libs/, res/) changed since a previous run with the same build mode,
+#   reuse its librustdesk.dll and only rebuild the Flutter app.
 name: Flutter Windows x64 Build
 
 on:
@@ -11,6 +18,14 @@ on:
       upload-tag:
         type: string
         default: "nightly"
+      fast-build:
+        description: "Faster Rust build (thin LTO), slightly larger binary"
+        type: boolean
+        default: true
+      reuse-rust:
+        description: "Reuse the previous Rust build if no Rust code changed"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -138,6 +153,15 @@ jobs:
         with:
           submodules: recursive
 
+      # Before the bridge files are restored, so they are not part of the hash.
+      - name: Restore a previous Rust build
+        id: rust-out
+        if: ${{ inputs.reuse-rust }}
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+        with:
+          path: rust-out
+          key: rust-out-${{ inputs.fast-build && 'fast' || 'full' }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'build.rs', 'vcpkg.json', 'src/**', 'libs/**', 'res/**') }}
+
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -145,6 +169,7 @@ jobs:
           path: ./
 
       - name: Install LLVM and Clang
+        if: steps.rust-out.outputs.cache-hit != 'true'
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
         with:
           version: ${{ env.LLVM_VERSION }}
@@ -179,11 +204,20 @@ jobs:
           targets: ${{ env.TARGET }}
           components: "rustfmt"
 
+      # Set before rust-cache so that fast and full builds keep separate caches.
+      - name: Use a faster release profile
+        if: ${{ inputs.fast-build }}
+        shell: bash
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=thin" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: windows-2022
 
       - name: Setup vcpkg with Github Actions binary cache
+        if: steps.rust-out.outputs.cache-hit != 'true'
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
         with:
           vcpkgDirectory: C:\vcpkg
@@ -191,6 +225,7 @@ jobs:
           doNotCache: false
 
       - name: Cache vcpkg binaries
+        if: steps.rust-out.outputs.cache-hit != 'true'
         uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           path: ${{ env.VCPKG_BINARY_CACHE }}
@@ -198,9 +233,11 @@ jobs:
           restore-keys: vcpkg-bin-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-
 
       - name: Create vcpkg binary cache directory
+        if: steps.rust-out.outputs.cache-hit != 'true'
         run: New-Item -ItemType Directory -Force -Path $env:VCPKG_BINARY_CACHE
 
       - name: Install vcpkg dependencies
+        if: steps.rust-out.outputs.cache-hit != 'true'
         env:
           VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
         run: |
@@ -220,10 +257,29 @@ jobs:
         shell: bash
 
       - name: Build rustdesk
+        if: steps.rust-out.outputs.cache-hit != 'true'
         run: |
           python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          New-Item -ItemType Directory -Force -Path rust-out | Out-Null
+          Copy-Item target/release/librustdesk.dll, target/release/deps/dylib_virtual_display.dll rust-out/
           mv ./flutter/build/windows/x64/runner/Release ./rustdesk
 
+      # What build.py's build_flutter_windows does after its cargo build.
+      - name: Build the Flutter app with the previous Rust build
+        if: steps.rust-out.outputs.cache-hit == 'true'
+        run: |
+          New-Item -ItemType Directory -Force -Path target/release/deps | Out-Null
+          Copy-Item rust-out/librustdesk.dll target/release/
+          Copy-Item rust-out/dylib_virtual_display.dll target/release/deps/
+          Push-Location flutter
+          flutter build windows --release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+          Copy-Item target/release/deps/dylib_virtual_display.dll flutter/build/windows/x64/runner/Release/
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+      - name: Add drivers
+        run: |
           # Download usbmmidd_v2.zip and extract it to ./rustdesk
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
           Expand-Archive usbmmidd_v2.zip -DestinationPath .
