@@ -21,7 +21,10 @@ env:
   BRIDGE_FLUTTER_VERSION: "3.22.3"
   LLVM_VERSION: "15.0.6"
   FLUTTER_VERSION: "3.24.5"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  # vcpkg removed its x-gha backend; keep built ports in a directory that
+  # actions/cache saves and restores instead.
+  VCPKG_BINARY_CACHE: C:\vcpkg-binary-cache
+  VCPKG_BINARY_SOURCES: "clear;files,C:\\vcpkg-binary-cache,readwrite"
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   VCPKG_TRIPLET: x64-windows-static
   TARGET: x86_64-pc-windows-msvc
@@ -186,6 +189,16 @@ jobs:
           vcpkgDirectory: C:\vcpkg
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
           doNotCache: false
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE }}
+          key: vcpkg-bin-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'res/vcpkg/**') }}
+          restore-keys: vcpkg-bin-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-
+
+      - name: Create vcpkg binary cache directory
+        run: New-Item -ItemType Directory -Force -Path $env:VCPKG_BINARY_CACHE
 
       - name: Install vcpkg dependencies
         env:
